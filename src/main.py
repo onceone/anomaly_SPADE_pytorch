@@ -1,4 +1,6 @@
 import argparse
+import copy
+
 import numpy as np
 import os
 import pickle
@@ -17,6 +19,10 @@ from torchvision.models import wide_resnet50_2
 
 import datasets.mvtec as mvtec
 
+# device setup
+# device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cpu'
+
 
 def parse_args():
     parser = argparse.ArgumentParser('SPADE')
@@ -25,28 +31,93 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-
-    args = parse_args()
-
-    # device setup
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+def load_model():
+    """加载模型，并在网络中加入钩子，用于后续钩出指定层的输出"""
     # load model
     model = wide_resnet50_2(pretrained=True, progress=True)
     model.to(device)
     model.eval()
 
     # set model's intermediate outputs
-    outputs = []
+    layer_outputs = []  # 用于保存与训练网网络特定层的输出，特征提取
+
     def hook(module, input, output):
-        outputs.append(output)
+        """钩子函数，用于输出网络中特定层的信息，这里输出指定层的输出"""
+        layer_outputs.append(output)
+
+    # 输出网络的特定层的输出
     model.layer1[-1].register_forward_hook(hook)
     model.layer2[-1].register_forward_hook(hook)
     model.layer3[-1].register_forward_hook(hook)
     model.avgpool.register_forward_hook(hook)
 
+    return model, layer_outputs
+
+
+def make_dataload(class_name):
+    """返回dataload"""
+    train_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=1, pin_memory=False)
+    test_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=1, pin_memory=False)
+
+    return train_dataloader, test_dataloader
+
+
+def extract_train_feature(args, train_dataloader, model, train_feature_outputs, class_name, layer_outputs):
+    """提取训练数据的特征，并保存"""
+    train_feature_filepath = os.path.join(args.save_path, 'temp', 'train_%s.pkl' % class_name)
+
+    if not os.path.exists(train_feature_filepath):
+        # 遍历训练集图片（每次遍历batch张），钩出网络特定层的输出，保存在字典中
+        for (x, y, mask) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
+            # 模型forward才能调用钩子方法
+            with torch.no_grad():
+                pred = model(x.to(device))
+            # 将网络中间（指定）层的输出保存到字典中
+            for k, v in zip(train_feature_outputs.keys(), layer_outputs):
+                train_feature_outputs[k].append(v)
+            # 清空，用于下一次保存
+            layer_outputs = []
+        # 对于每个指定层保存的输出，将其多次的输出在axis=0上合并
+        for k, v in train_feature_outputs.items():
+            train_feature_outputs[k] = torch.cat(v, 0)
+        # 保存提取的特征
+        with open(train_feature_filepath, 'wb') as f:
+            pickle.dump(train_feature_outputs, f)
+    else:
+        print('load train set feature from: %s' % train_feature_filepath)
+        with open(train_feature_filepath, 'rb') as f:
+            train_feature_outputs = pickle.load(f)
+
+    return train_feature_outputs
+
+
+def extract_test_test_feature(test_dataloader, model,test_feature_outputs):
+    gt_list = []
+    gt_mask_list = []
+    test_imgs = []
+    for (x, y, mask) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
+        test_imgs.extend(x.cpu().detach().numpy())
+        gt_list.extend(y.cpu().detach().numpy())
+        gt_mask_list.extend(mask.cpu().detach().numpy())
+        # model prediction
+        with torch.no_grad():
+            pred = model(x.to(device))
+        # get intermediate layer outputs
+        for k, v in zip(test_feature_outputs.keys(), layer_outputs):
+            test_feature_outputs[k].append(v)
+        # initialize hook outputs
+        layer_outputs = []
+    for k, v in test_feature_outputs.items():
+        test_feature_outputs[k] = torch.cat(v, 0)
+
+
+def main():
+    args = parse_args()
+
     os.makedirs(os.path.join(args.save_path, 'temp'), exist_ok=True)
+    model, layer_outputs = load_model()
 
     fig, ax = plt.subplots(1, 2, figsize=(20, 10))
     fig_img_rocauc = ax[0]
@@ -55,61 +126,25 @@ def main():
     total_roc_auc = []
     total_pixel_roc_auc = []
 
-    for class_name in mvtec.CLASS_NAMES:
+    for class_name in mvtec.CLASS_NAMES[:1]:
 
-        train_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=True)
-        train_dataloader = DataLoader(train_dataset, batch_size=32, pin_memory=True)
-        test_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=False)
-        test_dataloader = DataLoader(test_dataset, batch_size=32, pin_memory=True)
-
-        train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+        train_dataloader, test_dataloader = make_dataload(class_name)
+        # 从预训练模型中提取的特征
+        train_feature_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
         test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
 
-        # extract train set features
-        train_feature_filepath = os.path.join(args.save_path, 'temp', 'train_%s.pkl' % class_name)
-        if not os.path.exists(train_feature_filepath):
-            for (x, y, mask) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
-                # model prediction
-                with torch.no_grad():
-                    pred = model(x.to(device))
-                # get intermediate layer outputs
-                for k, v in zip(train_outputs.keys(), outputs):
-                    train_outputs[k].append(v)
-                # initialize hook outputs
-                outputs = []
-            for k, v in train_outputs.items():
-                train_outputs[k] = torch.cat(v, 0)
-            # save extracted feature
-            with open(train_feature_filepath, 'wb') as f:
-                pickle.dump(train_outputs, f)
-        else:
-            print('load train set feature from: %s' % train_feature_filepath)
-            with open(train_feature_filepath, 'rb') as f:
-                train_outputs = pickle.load(f)
+        # --------------------------------------------------------------------------
+        # 提取训练数据的特征
+        feature_outputs = copy.deepcopy(train_feature_outputs)
+        train_feature_outputs = extract_train_feature(args, train_dataloader, model, feature_outputs, class_name,
+                                                      layer_outputs)
 
-        gt_list = []
-        gt_mask_list = []
-        test_imgs = []
-
+        # --------------------------------------------------------------------------
         # extract test set features
-        for (x, y, mask) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
-            test_imgs.extend(x.cpu().detach().numpy())
-            gt_list.extend(y.cpu().detach().numpy())
-            gt_mask_list.extend(mask.cpu().detach().numpy())
-            # model prediction
-            with torch.no_grad():
-                pred = model(x.to(device))
-            # get intermediate layer outputs
-            for k, v in zip(test_outputs.keys(), outputs):
-                test_outputs[k].append(v)
-            # initialize hook outputs
-            outputs = []
-        for k, v in test_outputs.items():
-            test_outputs[k] = torch.cat(v, 0)
 
         # calculate distance matrix
         dist_matrix = calc_dist_matrix(torch.flatten(test_outputs['avgpool'], 1),
-                                       torch.flatten(train_outputs['avgpool'], 1))
+                                       torch.flatten(train_feature_outputs['avgpool'], 1))
 
         # select K nearest neighbor and take average
         topk_values, topk_indexes = torch.topk(dist_matrix, k=args.top_k, dim=1, largest=False)
@@ -128,12 +163,16 @@ def main():
             for layer_name in ['layer1', 'layer2', 'layer3']:  # for each layer
 
                 # construct a gallery of features at all pixel locations of the K nearest neighbors
-                topk_feat_map = train_outputs[layer_name][topk_indexes[t_idx]]
+                topk_feat_map = train_feature_outputs[layer_name][topk_indexes[t_idx]]
                 test_feat_map = test_outputs[layer_name][t_idx:t_idx + 1]
                 feat_gallery = topk_feat_map.transpose(3, 1).flatten(0, 2).unsqueeze(-1).unsqueeze(-1)
 
                 # calculate distance matrix
                 dist_matrix_list = []
+
+                if hasattr(torch.cuda, 'empty_cache'):
+                    torch.cuda.empty_cache()
+
                 for d_idx in range(feat_gallery.shape[0] // 100):
                     dist_matrix = torch.pairwise_distance(feat_gallery[d_idx * 100:d_idx * 100 + 100], test_feat_map)
                     dist_matrix_list.append(dist_matrix)
@@ -197,7 +236,6 @@ def calc_dist_matrix(x, y):
 
 def visualize_loc_result(test_imgs, gt_mask_list, score_map_list, threshold,
                          save_path, class_name, vis_num=5):
-
     for t_idx in range(vis_num):
         test_img = test_imgs[t_idx]
         test_img = denormalization(test_img)
