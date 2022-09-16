@@ -93,7 +93,8 @@ def extract_train_feature(args, train_dataloader, model, train_feature_outputs, 
     return train_feature_outputs
 
 
-def extract_test_test_feature(test_dataloader, model,test_feature_outputs):
+def extract_test_feature(test_dataloader, model, test_feature_outputs, class_name, layer_outputs):
+    """提取测试图片特征"""
     gt_list = []
     gt_mask_list = []
     test_imgs = []
@@ -101,14 +102,15 @@ def extract_test_test_feature(test_dataloader, model,test_feature_outputs):
         test_imgs.extend(x.cpu().detach().numpy())
         gt_list.extend(y.cpu().detach().numpy())
         gt_mask_list.extend(mask.cpu().detach().numpy())
-        # model prediction
+        # 模型前向传播才能调用钩子方法
         with torch.no_grad():
             pred = model(x.to(device))
-        # get intermediate layer outputs
+        # 用钩子函数，钩出特定层的输出，并保存在字典中
         for k, v in zip(test_feature_outputs.keys(), layer_outputs):
             test_feature_outputs[k].append(v)
-        # initialize hook outputs
+        # 清空列表，进行下一次迭代（测试图片）保存钩出的特征
         layer_outputs = []
+    # 对上述多次迭代后钩出的特征，在axis=0方向上合并，即迭代次数方向上
     for k, v in test_feature_outputs.items():
         test_feature_outputs[k] = torch.cat(v, 0)
 
@@ -117,7 +119,7 @@ def main():
     args = parse_args()
 
     os.makedirs(os.path.join(args.save_path, 'temp'), exist_ok=True)
-    model, layer_outputs = load_model()
+    model, hook_layer_outputs = load_model()
 
     fig, ax = plt.subplots(1, 2, figsize=(20, 10))
     fig_img_rocauc = ax[0]
@@ -131,19 +133,24 @@ def main():
         train_dataloader, test_dataloader = make_dataload(class_name)
         # 从预训练模型中提取的特征
         train_feature_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
-        test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+        test_feature_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
 
         # --------------------------------------------------------------------------
         # 提取训练数据的特征
-        feature_outputs = copy.deepcopy(train_feature_outputs)
-        train_feature_outputs = extract_train_feature(args, train_dataloader, model, feature_outputs, class_name,
-                                                      layer_outputs)
+
+        train_feature_outputs = copy.deepcopy(train_feature_outputs)  # 深拷贝，防止原始列表被修改
+        hook_layer_outputs = copy.deepcopy(hook_layer_outputs)
+        train_feature_outputs = extract_train_feature(args, train_dataloader, model, train_feature_outputs, class_name,
+                                                      hook_layer_outputs)
 
         # --------------------------------------------------------------------------
-        # extract test set features
+        # 提取测试集中的特征
+        test_feature_outputs = copy.deepcopy(test_feature_outputs)  # 深拷贝，防止原始列表被修改
+        hook_layer_outputs = copy.deepcopy(hook_layer_outputs)
+        extract_test_feature(test_dataloader, model, test_feature_outputs, class_name, hook_layer_outputs)
 
         # calculate distance matrix
-        dist_matrix = calc_dist_matrix(torch.flatten(test_outputs['avgpool'], 1),
+        dist_matrix = calc_dist_matrix(torch.flatten(test_feature_outputs['avgpool'], 1),
                                        torch.flatten(train_feature_outputs['avgpool'], 1))
 
         # select K nearest neighbor and take average
@@ -158,13 +165,13 @@ def main():
         fig_img_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, roc_auc))
 
         score_map_list = []
-        for t_idx in tqdm(range(test_outputs['avgpool'].shape[0]), '| localization | test | %s |' % class_name):
+        for t_idx in tqdm(range(test_feature_outputs['avgpool'].shape[0]), '| localization | test | %s |' % class_name):
             score_maps = []
             for layer_name in ['layer1', 'layer2', 'layer3']:  # for each layer
 
                 # construct a gallery of features at all pixel locations of the K nearest neighbors
                 topk_feat_map = train_feature_outputs[layer_name][topk_indexes[t_idx]]
-                test_feat_map = test_outputs[layer_name][t_idx:t_idx + 1]
+                test_feat_map = test_feature_outputs[layer_name][t_idx:t_idx + 1]
                 feat_gallery = topk_feat_map.transpose(3, 1).flatten(0, 2).unsqueeze(-1).unsqueeze(-1)
 
                 # calculate distance matrix
