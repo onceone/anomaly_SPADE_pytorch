@@ -8,15 +8,16 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 
-
 URL = 'ftp://guest:GU.205dldo@ftp.softronics.ch/mvtec_anomaly_detection/mvtec_anomaly_detection.tar.xz'
 CLASS_NAMES = ['bottle', 'cable', 'capsule', 'carpet', 'grid',
                'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
                'tile', 'toothbrush', 'transistor', 'wood', 'zipper']
 
+file_path = '/home/w/Project/DataSets/anom/mvtec/'  # '../data'
+
 
 class MVTecDataset(Dataset):
-    def __init__(self, root_path='../data', class_name='bottle', is_train=True,
+    def __init__(self, root_path=file_path, class_name='bottle', is_train=True,
                  resize=256, cropsize=224):
         assert class_name in CLASS_NAMES, 'class_name: {}, should be in {}'.format(class_name, CLASS_NAMES)
         self.root_path = root_path
@@ -24,7 +25,8 @@ class MVTecDataset(Dataset):
         self.is_train = is_train
         self.resize = resize
         self.cropsize = cropsize
-        self.mvtec_folder_path = os.path.join(root_path, 'mvtec_anomaly_detection')
+        # self.mvtec_folder_path = os.path.join(root_path, 'mvtec_anomaly_detection')
+        self.mvtec_folder_path = os.path.join(root_path)
 
         # download dataset if not exist
         self.download()
