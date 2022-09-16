@@ -38,7 +38,7 @@ def load_model():
     model.to(device)
     model.eval()
 
-    # set model's intermediate outputs
+    global layer_outputs
     layer_outputs = []  # 用于保存与训练网网络特定层的输出，特征提取
 
     def hook(module, input, output):
@@ -64,8 +64,11 @@ def make_dataload(class_name):
     return train_dataloader, test_dataloader
 
 
-def extract_train_feature(args, train_dataloader, model, train_feature_outputs, class_name, layer_outputs):
-    """提取训练数据的特征，并保存"""
+def extract_train_feature(args, train_dataloader, model, class_name):
+    """提取训练数据的特征，并保存，字典做参数，内容别修改，不用返回 , layer_outputs"""
+    global layer_outputs
+    train_feature_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+
     train_feature_filepath = os.path.join(args.save_path, 'temp', 'train_%s.pkl' % class_name)
 
     if not os.path.exists(train_feature_filepath):
@@ -79,7 +82,8 @@ def extract_train_feature(args, train_dataloader, model, train_feature_outputs, 
                 train_feature_outputs[k].append(v)
             # 清空，用于下一次保存
             layer_outputs = []
-        # 对于每个指定层保存的输出，将其多次的输出在axis=0上合并
+        # 对于每个指定层保存的输出，将其多次的输出在axis=0上合并，
+        # n * [1,channel,height,width] -> [n,channel,height,width]
         for k, v in train_feature_outputs.items():
             train_feature_outputs[k] = torch.cat(v, 0)
         # 保存提取的特征
@@ -93,8 +97,10 @@ def extract_train_feature(args, train_dataloader, model, train_feature_outputs, 
     return train_feature_outputs
 
 
-def extract_test_feature(test_dataloader, model, test_feature_outputs, class_name, layer_outputs):
-    """提取测试图片特征"""
+def extract_test_feature(test_dataloader, model, class_name, layer_outputs):
+    """提取测试图片特征,"""
+    test_feature_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+
     gt_list = []
     gt_mask_list = []
     test_imgs = []
@@ -114,6 +120,8 @@ def extract_test_feature(test_dataloader, model, test_feature_outputs, class_nam
     for k, v in test_feature_outputs.items():
         test_feature_outputs[k] = torch.cat(v, 0)
 
+    return test_feature_outputs, test_imgs, gt_list, gt_mask_list
+
 
 def main():
     args = parse_args()
@@ -132,22 +140,15 @@ def main():
 
         train_dataloader, test_dataloader = make_dataload(class_name)
         # 从预训练模型中提取的特征
-        train_feature_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
-        test_feature_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
 
         # --------------------------------------------------------------------------
-        # 提取训练数据的特征
-
-        train_feature_outputs = copy.deepcopy(train_feature_outputs)  # 深拷贝，防止原始列表被修改
-        hook_layer_outputs = copy.deepcopy(hook_layer_outputs)
-        train_feature_outputs = extract_train_feature(args, train_dataloader, model, train_feature_outputs, class_name,
-                                                      hook_layer_outputs)
+        # 提取训练数据的特征,[n,channel,height,width] , n为迭代次数
+        train_feature_outputs = extract_train_feature(args, train_dataloader, model, class_name)
 
         # --------------------------------------------------------------------------
         # 提取测试集中的特征
-        test_feature_outputs = copy.deepcopy(test_feature_outputs)  # 深拷贝，防止原始列表被修改
-        hook_layer_outputs = copy.deepcopy(hook_layer_outputs)
-        extract_test_feature(test_dataloader, model, test_feature_outputs, class_name, hook_layer_outputs)
+        test_feature_outputs, test_imgs, gt_list, gt_mask_list = extract_test_feature(test_dataloader, model,
+                                                                                      class_name, hook_layer_outputs)
 
         # calculate distance matrix
         dist_matrix = calc_dist_matrix(torch.flatten(test_feature_outputs['avgpool'], 1),
@@ -231,7 +232,11 @@ def main():
 
 
 def calc_dist_matrix(x, y):
-    """Calculate Euclidean distance matrix with torch.tensor"""
+    """Calculate Euclidean distance matrix with torch.tensor
+        x: [1,2048]
+        y: [1,2048]
+    """
+
     n = x.size(0)
     m = y.size(0)
     d = x.size(1)
