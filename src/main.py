@@ -169,10 +169,10 @@ def main():
         print('%s ROCAUC: %.3f' % (class_name, roc_auc))
         fig_img_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, roc_auc))
         # ----------------------------------------------------------------------------------------------------
-        score_map_list = []
+        score_map_list = []  # 保存所有处理后的测试图片
         for t_idx in tqdm(range(test_feature_outputs['avgpool'].shape[0]), '| localization | test | %s |' % class_name):
-            score_maps_all_layers = []  #
-            for layer_name in ['layer1', 'layer2', 'layer3']:
+            score_maps_all_layers = []  # 保存 所有层(layer1,layer2,layer3) 中测试集与对应的层中的训练集特征图最近个score_map
+            for layer_name in ['layer1', 'layer2', 'layer3']:  # 图像通道数分别为：256、512、1024
 
                 # -----------------------------------------------------------------------------------------------
                 # 遍历每“张”（batch张），“特定层”中训练集的特征图
@@ -192,13 +192,13 @@ def main():
                 # 计算每"张"(batch张）测试特征图和最近的5“张”(batch张)训练特征图的距离
                 # test,test_feat_map: [1,256,56,56]  ,逐层、逐个遍历
                 # train,feat_gallery: [156800,256,1,1]
-                # calculate distance matrix
                 dist_matrix_list = []
                 for d_idx in range(feat_gallery.shape[0] // 100):
                     # feat_gallery:[15680,256,1,1];
                     train_feat = feat_gallery[d_idx * 100:d_idx * 100 + 100]
                     # train_feat: [100,256,1,1]  test_feat_map:[1,256,56,56]  -> [100,256,56]
                     # train_feat和test_feat_map的batch要相等，或其中一个为1
+                    """这里实际是对最后一维进行距离计算，可以理解为特征图对应行计算距离"""
                     dist = torch.pairwise_distance(train_feat, test_feat_map)
                     dist_matrix_list.append(dist)
                 # 156*[100,256,56]-> [15600,256,56]
@@ -210,17 +210,20 @@ def main():
                 score_map = F.interpolate(score_map.unsqueeze(0).unsqueeze(0), size=224, mode='bilinear',
                                           align_corners=False)
                 score_maps_all_layers.append(score_map)
+                # ------------------------------------------------------------------------------------------------
 
-            # average distance between the features
-            score_map = torch.mean(torch.cat(score_maps_all_layers, 0), dim=0)
+            # ----------------------------------------------------------------------------------------------------
+            # 对三个层中的特征图求平均, 3*[1,1,224,224] -> [3,1,224,224] -> [1,224,224]
+            score_map_layer_mean = torch.mean(torch.cat(score_maps_all_layers, 0), dim=0)
 
-            # apply gaussian smoothing on the score map
-            score_map = gaussian_filter(score_map.squeeze().cpu().detach().numpy(), sigma=4)
-            score_map_list.append(score_map)
-
+            # apply gaussian smoothing on the score map [1,224,224] -> [224,224]
+            score_map_layer_smooth = gaussian_filter(score_map_layer_mean.squeeze().cpu().detach().numpy(), sigma=4)
+            score_map_list.append(score_map_layer_smooth)
+        # ----------------------------------------------------------------------------------------------------------
         flatten_gt_mask_list = np.concatenate(gt_mask_list).ravel()
         flatten_score_map_list = np.concatenate(score_map_list).ravel()
 
+        # ----------------------------------------------------------------------------------------------------------
         # calculate per-pixel level ROCAUC
         fpr, tpr, _ = roc_curve(flatten_gt_mask_list, flatten_score_map_list)
         per_pixel_rocauc = roc_auc_score(flatten_gt_mask_list, flatten_score_map_list)
@@ -228,6 +231,7 @@ def main():
         print('%s pixel ROCAUC: %.3f' % (class_name, per_pixel_rocauc))
         fig_pixel_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, per_pixel_rocauc))
 
+        # ----------------------------------------------------------------------------------------------------------
         # get optimal threshold
         precision, recall, thresholds = precision_recall_curve(flatten_gt_mask_list, flatten_score_map_list)
         a = 2 * precision * recall
@@ -235,6 +239,7 @@ def main():
         f1 = np.divide(a, b, out=np.zeros_like(a), where=b != 0)
         threshold = thresholds[np.argmax(f1)]
 
+        # ----------------------------------------------------------------------------------------------------------
         # visualize localization result
         visualize_loc_result(test_img, gt_mask_list, score_map_list, threshold, args.save_path, class_name, vis_num=5)
 
