@@ -18,8 +18,7 @@ from tqdm import tqdm
 import datasets.mvtec as mvtec
 
 # device setup
-# device = 'cuda' if torch.cuda.is_available() else 'cpu'
-device = 'cpu'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def parse_args():
@@ -63,10 +62,9 @@ def make_dataload(class_name):
 
 
 def extract_train_feature(args, train_dataloader, model, class_name):
-    """提取训练数据的特征，并保存，字典做参数，内容别修改，不用返回 , layer_outputs"""
+    """提取训练数据的特征，并保存"""
     global layer_outputs
     train_feature_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
-
     train_feature_filepath = os.path.join(args.save_path, 'temp', 'train_%s.pkl' % class_name)
 
     if not os.path.exists(train_feature_filepath):
@@ -80,8 +78,7 @@ def extract_train_feature(args, train_dataloader, model, class_name):
                 train_feature_outputs[k].append(v)
             # 清空，用于下一次保存
             layer_outputs = []
-        # 对于每个指定层保存的输出，将其多次的输出在axis=0上合并，
-        # n * [1,channel,height,width] -> [n,channel,height,width]
+        # 对于每个指定层保存的输出，将其多次的输出在axis=0上合并，n * [1,channel,height,width] -> [n,channel,height,width]
         for k, v in train_feature_outputs.items():
             train_feature_outputs[k] = torch.cat(v, 0)
         # 保存提取的特征
@@ -122,6 +119,64 @@ def extract_test_feature(test_dataloader, model, class_name):
     return test_feature_outputs, test_imgs, gt_list, gt_mask_list
 
 
+def pixel_locate(train_feature_outputs, test_feature_outputs, topk_indexes, class_name):
+    """对所有测试图片进行遍历，同时找到每张图片对应的最近的5张训练图片。每张测试图片经过网络，分别提取其中的layer1、layer2、layer3层的特征图，对应d
+    5张训练图片也提取这三层。一张测试图片与最近的5张训练图片，在对应层的输出特征图上计算距离，即每张测试图片生成3张距离图（得分图），在取平均，即完成
+    了每张测试图片的距离计算，最后经过高斯滤波进行平滑"""
+    score_map_list = []  # 保存所有处理后的测试图片
+    for t_idx in tqdm(range(test_feature_outputs['avgpool'].shape[0]), '| localization | test | %s |' % class_name):
+        score_maps_all_layers = []  # 保存 所有层(layer1,layer2,layer3) 中测试集与对应的层中的训练集特征图最近个score_map
+        for layer_name in ['layer1', 'layer2', 'layer3']:  # 图像通道数分别为：256、512、1024
+
+            # -----------------------------------------------------------------------------------------------
+            # 遍历每“张”（batch张），“特定层”中训练集的特征图
+            """ construct a gallery of features at all pixel locations of the K nearest neighbors
+            train_feature_outputs['layer1']:[209,256,56,56] ,topk_indexs:[83,5],topk_indexs[0]: (5,)
+            依次找每张测试图片距离最近的的5张(训练图片在网络中指定层的)特征图,eg: top_feat_map:[5,256,56,56],5张layer1层的特征"""
+            topk_feat_map = train_feature_outputs[layer_name][topk_indexes[t_idx]]
+            # [83,256,56,56]->[1,256,56,56],选择指定索引的测试图片指定层的特征图，为保持shape,使用索引切片
+            test_feat_map = test_feature_outputs[layer_name][t_idx:t_idx + 1]
+            # [5,256,56,56],->[5,56,56,256] ->[15680,256]->[15680,256,1] -> [15680,256,1,1]
+            feat_gallery = topk_feat_map.transpose(3, 1).flatten(0, 2).unsqueeze(-1).unsqueeze(-1)
+            feat_gallery = feat_gallery.to(device)
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+
+            # -----------------------------------------------------------------------------------------------
+            # 计算每"张"(batch张）测试特征图和最近的5“张”(batch张)训练特征图的距离
+            # test,test_feat_map: [1,256,56,56]  ,逐层、逐个遍历
+            # train,feat_gallery: [156800,256,1,1]
+            dist_matrix_list = []
+            for d_idx in range(feat_gallery.shape[0] // 100):
+                # feat_gallery:[15680,256,1,1];
+                train_feat = feat_gallery[d_idx * 100:d_idx * 100 + 100]
+                # train_feat: [100,256,1,1]  test_feat_map:[1,256,56,56]  -> [100,256,56]
+                # train_feat和test_feat_map的batch要相等，或其中一个为1
+                """这里实际是对最后一维进行距离计算，可以理解为特征图对应行计算距离"""
+                dist = torch.pairwise_distance(train_feat, test_feat_map)
+                dist_matrix_list.append(dist)
+            # 156*[100,256,56]-> [15600,256,56]
+            dist_matrix = torch.cat(dist_matrix_list, 0)
+            # ------------------------------------------------------------------------------------------------
+            # k nearest features from the gallery (k=1)
+            score_map = torch.min(dist_matrix, dim=0)[0]  # 最小值 [15600,256,56] -> [256,56]
+            # [256,56] -> [1,1,256,56] -> [1,1,224,224]
+            score_map = F.interpolate(score_map.unsqueeze(0).unsqueeze(0), size=224, mode='bilinear',
+                                      align_corners=False)
+            score_maps_all_layers.append(score_map)
+            # ------------------------------------------------------------------------------------------------
+
+        # ----------------------------------------------------------------------------------------------------
+        # 对三个层中的特征图求平均, 3*[1,1,224,224] -> [3,1,224,224] -> [1,224,224]
+        score_map_layer_mean = torch.mean(torch.cat(score_maps_all_layers, 0), dim=0)
+
+        # apply gaussian smoothing on the score map [1,224,224] -> [224,224]
+        score_map_layer_smooth = gaussian_filter(score_map_layer_mean.squeeze().cpu().detach().numpy(), sigma=4)
+        score_map_list.append(score_map_layer_smooth)
+
+    return score_map_list
+
+
 def main():
     args = parse_args()
 
@@ -136,7 +191,6 @@ def main():
     total_pixel_roc_auc = []
 
     for class_name in mvtec.CLASS_NAMES[:1]:
-
         train_dataloader, test_dataloader = make_dataload(class_name)
         # --------------------------------------------------------------------------------------------------
         # 说明：如下注释中的“每张”概念，实际是batch张图片，即，以一个batch为单位！！！！！！
@@ -162,64 +216,19 @@ def main():
         # [83,5] -> [83],5个值取平均 ,即每个测试图片与（5个）训练图片的距离，把距离当做得分
         scores = torch.mean(topk_values, 1).cpu().detach().numpy()
 
+        # ---------------------------------------------------------------------------------------------------------
         # calculate image-level ROC AUC score
         fpr, tpr, _ = roc_curve(gt_list, scores)
         roc_auc = roc_auc_score(gt_list, scores)
         total_roc_auc.append(roc_auc)
         print('%s ROCAUC: %.3f' % (class_name, roc_auc))
         fig_img_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, roc_auc))
-        # ----------------------------------------------------------------------------------------------------
-        score_map_list = []  # 保存所有处理后的测试图片
-        for t_idx in tqdm(range(test_feature_outputs['avgpool'].shape[0]), '| localization | test | %s |' % class_name):
-            score_maps_all_layers = []  # 保存 所有层(layer1,layer2,layer3) 中测试集与对应的层中的训练集特征图最近个score_map
-            for layer_name in ['layer1', 'layer2', 'layer3']:  # 图像通道数分别为：256、512、1024
 
-                # -----------------------------------------------------------------------------------------------
-                # 遍历每“张”（batch张），“特定层”中训练集的特征图
-                """ construct a gallery of features at all pixel locations of the K nearest neighbors
-                train_feature_outputs['layer1']:[209,256,56,56] ,topk_indexs:[83,5],topk_indexs[0]: (5,)
-                依次找每张测试图片距离最近的的5张(训练图片在网络中指定层的)特征图,eg: top_feat_map:[5,256,56,56],5张layer1层的特征"""
-                topk_feat_map = train_feature_outputs[layer_name][topk_indexes[t_idx]]
-                # [83,256,56,56]->[1,256,56,56],选择指定索引的测试图片指定层的特征图，为保持shape,使用索引切片
-                test_feat_map = test_feature_outputs[layer_name][t_idx:t_idx + 1]
-                # [5,256,56,56],->[5,56,56,256] ->[15680,256]->[15680,256,1] -> [15680,256,1,1]
-                feat_gallery = topk_feat_map.transpose(3, 1).flatten(0, 2).unsqueeze(-1).unsqueeze(-1)
-
-                if hasattr(torch.cuda, 'empty_cache'):
-                    torch.cuda.empty_cache()
-
-                # -----------------------------------------------------------------------------------------------
-                # 计算每"张"(batch张）测试特征图和最近的5“张”(batch张)训练特征图的距离
-                # test,test_feat_map: [1,256,56,56]  ,逐层、逐个遍历
-                # train,feat_gallery: [156800,256,1,1]
-                dist_matrix_list = []
-                for d_idx in range(feat_gallery.shape[0] // 100):
-                    # feat_gallery:[15680,256,1,1];
-                    train_feat = feat_gallery[d_idx * 100:d_idx * 100 + 100]
-                    # train_feat: [100,256,1,1]  test_feat_map:[1,256,56,56]  -> [100,256,56]
-                    # train_feat和test_feat_map的batch要相等，或其中一个为1
-                    """这里实际是对最后一维进行距离计算，可以理解为特征图对应行计算距离"""
-                    dist = torch.pairwise_distance(train_feat, test_feat_map)
-                    dist_matrix_list.append(dist)
-                # 156*[100,256,56]-> [15600,256,56]
-                dist_matrix = torch.cat(dist_matrix_list, 0)
-                # ------------------------------------------------------------------------------------------------
-                # k nearest features from the gallery (k=1)
-                score_map = torch.min(dist_matrix, dim=0)[0]  # 最小值 [15600,256,56] -> [256,56]
-                # [256,56] -> [1,1,256,56] -> [1,1,224,224]
-                score_map = F.interpolate(score_map.unsqueeze(0).unsqueeze(0), size=224, mode='bilinear',
-                                          align_corners=False)
-                score_maps_all_layers.append(score_map)
-                # ------------------------------------------------------------------------------------------------
-
-            # ----------------------------------------------------------------------------------------------------
-            # 对三个层中的特征图求平均, 3*[1,1,224,224] -> [3,1,224,224] -> [1,224,224]
-            score_map_layer_mean = torch.mean(torch.cat(score_maps_all_layers, 0), dim=0)
-
-            # apply gaussian smoothing on the score map [1,224,224] -> [224,224]
-            score_map_layer_smooth = gaussian_filter(score_map_layer_mean.squeeze().cpu().detach().numpy(), sigma=4)
-            score_map_list.append(score_map_layer_smooth)
+        # ---------------------------------------------------------------------------------------------------------
+        # 83*[224,224] 所有测试图片中像素的分数图（与最近的5张训练图片的距离）
+        score_map_list = pixel_locate(train_feature_outputs, test_feature_outputs, topk_indexes, class_name)
         # ----------------------------------------------------------------------------------------------------------
+        # 83*[224,224] -> [83,224,224]
         flatten_gt_mask_list = np.concatenate(gt_mask_list).ravel()
         flatten_score_map_list = np.concatenate(score_map_list).ravel()
 
@@ -243,16 +252,20 @@ def main():
         # visualize localization result
         visualize_loc_result(test_img, gt_mask_list, score_map_list, threshold, args.save_path, class_name, vis_num=5)
 
+    # -------------------------------------------------------------------------------------------------------------
+    # img-level ROCAUC
     print('Average ROCAUC: %.3f' % np.mean(total_roc_auc))
     fig_img_rocauc.title.set_text('Average image ROCAUC: %.3f' % np.mean(total_roc_auc))
     fig_img_rocauc.legend(loc="lower right")
-
+    # ----------------------------------------------------------------------------------------
+    # pixel-level ROCAUC
     print('Average pixel ROCUAC: %.3f' % np.mean(total_pixel_roc_auc))
     fig_pixel_rocauc.title.set_text('Average pixel ROCAUC: %.3f' % np.mean(total_pixel_roc_auc))
     fig_pixel_rocauc.legend(loc="lower right")
 
     fig.tight_layout()
     fig.savefig(os.path.join(args.save_path, 'roc_curve.png'), dpi=100)
+    # -----------------------------------------------------------------------------------------------------------
 
 
 def calc_dist_matrix(x, y):
@@ -314,3 +327,4 @@ def denormalization(x):
 
 if __name__ == '__main__':
     main()
+    # model, hook_layer_outputs = load_model()
